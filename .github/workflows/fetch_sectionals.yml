@@ -1,0 +1,30 @@
+name: Fetch Netkeiba Sectionals
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install pandas requests beautifulsoup4
+
+      - run: python fetch_sectionals.py
+
+      - name: Commit results
+        run: |
+          git config user.name "geometry-v2-bot"
+          git config user.email "geometry-v2-bot@users.noreply.github.com"
+          git add netkeiba_200m_laps_2022_validation.csv failed_urls.csv
+          git commit -m "Fetch sectional laps" || exit 0
+          git push
