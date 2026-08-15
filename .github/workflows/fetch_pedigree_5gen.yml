@@ -1,0 +1,30 @@
+name: Fetch 5gen Pedigrees
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install pandas requests beautifulsoup4
+
+      - run: python fetch_pedigree_5gen.py
+
+      - name: Commit pedigree results
+        run: |
+          git config user.name "pedigree-v1-bot"
+          git config user.email "pedigree-v1-bot@users.noreply.github.com"
+          git add pedigree_5gen_train_validation.csv pedigree_failed.csv
+          git commit -m "Fetch 5-generation pedigrees" || exit 0
+          git push
