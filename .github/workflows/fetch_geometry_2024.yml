@@ -1,0 +1,37 @@
+name: Fetch Geometry 2024 CLEAN
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "manifest_2024_geometry_clean.csv"
+      - "fetch_sectionals_2024_geometry.py"
+      - ".github/workflows/fetch_geometry_2024.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pandas requests beautifulsoup4
+
+      - name: Fetch 200m sectionals
+        run: python fetch_sectionals_2024_geometry.py
+
+      - name: Commit outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add netkeiba_200m_laps_2024_clean.csv failed_urls_2024_geometry.csv
+          git diff --cached --quiet || git commit -m "Fetch Geometry v2 2024 CLEAN sectionals"
+          git push
