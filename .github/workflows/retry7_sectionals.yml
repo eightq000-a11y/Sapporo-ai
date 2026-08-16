@@ -1,0 +1,30 @@
+name: Retry 7 Sectionals
+
+on:
+  workflow_dispatch:
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install pandas requests beautifulsoup4
+
+      - run: python retry_failed_sectionals.py
+
+      - name: Commit retry results
+        run: |
+          git config user.name "sectional-retry-bot"
+          git config user.email "sectional-retry-bot@users.noreply.github.com"
+          git add netkeiba_200m_laps_2022_validation.csv failed_urls.csv
+          git commit -m "Retry failed sectional races" || exit 0
+          git push
