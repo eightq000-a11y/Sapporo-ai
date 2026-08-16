@@ -1,0 +1,351 @@
+name: Build Structured Pedigree Features
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build_pedigree_features.yml"
+      - "pedigree_5gen_train_validation.csv"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pandas
+
+      - name: Build structured pedigree master and features
+        shell: bash
+        run: |
+          cat > build_pedigree_features.py <<'PY'
+          import re, math, unicodedata
+          from collections import defaultdict, Counter
+          import pandas as pd
+
+          INFILE = "pedigree_5gen_train_validation.csv"
+          OUT_WIDE = "pedigree_5gen_structured.csv"
+          OUT_LONG = "pedigree_positions_long.csv"
+          OUT_CROSS = "pedigree_crosses.csv"
+          OUT_FEATURES = "pedigree_features_v1.csv"
+          OUT_DICT = "pedigree_lineage_dictionary_v1.csv"
+          OUT_QC = "pedigree_qc_v1.csv"
+
+          # Preorder traversal paths for the 62 ancestors:
+          # S, SS, SSS... then sire's dam branches; after 31 sire-side nodes, D...
+          def preorder_paths(prefix="", depth=0, max_depth=5):
+              out=[]
+              if depth >= max_depth:
+                  return out
+              for child in ("S","D"):
+                  p=prefix+child
+                  out.append(p)
+                  out.extend(preorder_paths(p, depth+1, max_depth))
+              return out
+
+          PATHS=preorder_paths()
+          assert len(PATHS)==62
+          IDX_TO_PATH={i+1:p for i,p in enumerate(PATHS)}
+
+          def fix_mojibake(x):
+              if pd.isna(x):
+                  return ""
+              s=str(x).strip()
+              # netkeiba historical page was decoded as Latin-1 although source bytes were EUC-JP.
+              # Typical broken forms contain ¥, ¡, ¹ etc.
+              suspicious = any(ch in s for ch in ("¥","¡","¹","¤","£","¢","§","¬","«","½","¼","¾"))
+              if suspicious:
+                  try:
+                      cand=s.encode("latin1").decode("euc_jp")
+                      # Accept if it introduces Japanese characters or substantially removes mojibake markers.
+                      if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", cand):
+                          s=cand
+                  except Exception:
+                      pass
+              return unicodedata.normalize("NFKC", s).strip()
+
+          def canonical_name(s):
+              s=fix_mojibake(s)
+              s=re.sub(r"\s+"," ",s).strip()
+              # Repair one common duplicate rendering.
+              s=re.sub(r"\b(In the Wings)\s+In The Wings\b", r"\1", s, flags=re.I)
+              # Canonical aliases used for cross/line matching.
+              aliases = [
+                  (r"サンデーサイレンス(?:\s+Sunday Silence)?", "Sunday Silence"),
+                  (r"ノーザンダンサー(?:\s+Northern Dancer)?", "Northern Dancer"),
+                  (r"ミスタープロスペクター|Mr\.?\s*Prospector", "Mr. Prospector"),
+                  (r"キングマンボ|Kingmambo", "Kingmambo"),
+                  (r"ロベルト|Roberto", "Roberto"),
+                  (r"サドラーズウェルズ|Sadler'?s Wells", "Sadler's Wells"),
+                  (r"ダンジグ|Danzig", "Danzig"),
+                  (r"ヘイロー|Halo", "Halo"),
+                  (r"ヘイルトゥリーズン|Hail to Reason", "Hail to Reason"),
+                  (r"シアトルスルー|Seattle Slew", "Seattle Slew"),
+                  (r"エーピーインディ|A\.?P\.? Indy", "A.P. Indy"),
+                  (r"ニジンスキー|Nijinsky", "Nijinsky"),
+                  (r"ヌレイエフ|Nureyev", "Nureyev"),
+                  (r"ストームキャット|Storm Cat", "Storm Cat"),
+                  (r"デピュティミニスター|Deputy Minister", "Deputy Minister"),
+                  (r"トニービン|Tony Bin", "Tony Bin"),
+                  (r"リファール|Lyphard", "Lyphard"),
+                  (r"ネイティヴダンサー|Native Dancer", "Native Dancer"),
+                  (r"レイズアネイティヴ|Raise a Native", "Raise a Native"),
+                  (r"ナスルーラ|Nasrullah", "Nasrullah"),
+                  (r"ネアルコ|Nearco", "Nearco"),
+                  (r"ノーザンテースト|Northern Taste", "Northern Taste"),
+                  (r"ディープインパクト|Deep Impact", "Deep Impact"),
+                  (r"ステイゴールド|Stay Gold", "Stay Gold"),
+                  (r"ハーツクライ|Heart'?s Cry", "Heart's Cry"),
+                  (r"キングカメハメハ|King Kamehameha", "King Kamehameha"),
+              ]
+              for pat, repl in aliases:
+                  if re.search(pat, s, flags=re.I):
+                      # if alias is embedded alongside Japanese, canonicalize to stable English token
+                      return repl
+              return s
+
+          # Hierarchical tags. First match is the most specific line.
+          LINE_RULES = [
+              ("Deep Impact", {"Deep Impact"}),
+              ("Stay Gold", {"Stay Gold"}),
+              ("Heart's Cry", {"Heart's Cry"}),
+              ("Sunday Silence", {"Sunday Silence"}),
+              ("King Kamehameha", {"King Kamehameha"}),
+              ("Kingmambo", {"Kingmambo"}),
+              ("Mr. Prospector", {"Mr. Prospector"}),
+              ("Sadler's Wells", {"Sadler's Wells"}),
+              ("Danzig", {"Danzig"}),
+              ("Nijinsky", {"Nijinsky"}),
+              ("Nureyev", {"Nureyev"}),
+              ("Lyphard", {"Lyphard"}),
+              ("Northern Dancer", {"Northern Dancer"}),
+              ("Storm Cat", {"Storm Cat"}),
+              ("Deputy Minister", {"Deputy Minister"}),
+              ("A.P. Indy", {"A.P. Indy"}),
+              ("Seattle Slew", {"Seattle Slew"}),
+              ("Roberto", {"Roberto"}),
+              ("Halo", {"Halo"}),
+              ("Hail to Reason", {"Hail to Reason"}),
+              ("Tony Bin", {"Tony Bin"}),
+              ("Raise a Native", {"Raise a Native"}),
+              ("Native Dancer", {"Native Dancer"}),
+              ("Nasrullah", {"Nasrullah"}),
+              ("Nearco", {"Nearco"}),
+          ]
+
+          # Broad-line ancestry rules for practical grouping.
+          BROAD_PARENT = {
+              "Deep Impact":"Sunday Silence","Stay Gold":"Sunday Silence","Heart's Cry":"Sunday Silence",
+              "Sunday Silence":"Halo","Halo":"Hail to Reason",
+              "King Kamehameha":"Kingmambo","Kingmambo":"Mr. Prospector",
+              "Mr. Prospector":"Raise a Native","Raise a Native":"Native Dancer",
+              "Sadler's Wells":"Northern Dancer","Danzig":"Northern Dancer","Nijinsky":"Northern Dancer",
+              "Nureyev":"Northern Dancer","Lyphard":"Northern Dancer",
+              "A.P. Indy":"Seattle Slew",
+              "Storm Cat":"Northern Dancer","Deputy Minister":"Northern Dancer",
+              "Roberto":"Hail to Reason",
+          }
+
+          def lineage_from_branch(entries, start_path):
+              # Follow an unbroken paternal chain from the branch root:
+              # e.g. sire: S,SS,SSS... ; broodmare sire: DS,DSS...
+              paths=[start_path]
+              while len(paths[-1])<5:
+                  paths.append(paths[-1]+"S")
+              names=[entries.get(p,"") for p in paths]
+              names=[canonical_name(n) for n in names if n]
+              # choose the nearest recognized founder/subline encountered
+              for n in names:
+                  for tag, founders in LINE_RULES:
+                      if n in founders:
+                          return tag
+              return names[0] if names else "UNKNOWN"
+
+          def broad_line(tag):
+              cur=tag
+              seen=set()
+              while cur in BROAD_PARENT and cur not in seen:
+                  seen.add(cur)
+                  cur=BROAD_PARENT[cur]
+              return cur
+
+          df=pd.read_csv(INFILE, dtype={"horse_id":str})
+          ped_cols=[f"ped_{i:02d}" for i in range(1,63)]
+
+          long_rows=[]
+          wide_rows=[]
+          cross_rows=[]
+          feature_rows=[]
+          qc_rows=[]
+
+          for _,row in df.iterrows():
+              hid=str(row.get("horse_id",""))
+              hname=fix_mojibake(row.get("horse_name",""))
+              source=str(row.get("source_url",""))
+              entries={}
+              raw_nonempty=0
+              repaired=0
+
+              for i,c in enumerate(ped_cols,1):
+                  raw=row.get(c,"")
+                  clean=fix_mojibake(raw)
+                  if clean:
+                      raw_nonempty += 1
+                  if str(raw).strip()!=clean and clean:
+                      repaired += 1
+                  p=IDX_TO_PATH[i]
+                  entries[p]=clean
+                  gen=len(p)
+                  long_rows.append({
+                      "horse_id":hid,"horse_name":hname,"source_url":source,
+                      "raw_index":i,"path":p,"generation":gen,
+                      "side":"SIRE" if p.startswith("S") else "DAM",
+                      "ancestor":clean,"ancestor_canonical":canonical_name(clean),
+                      "blood_share_pct":100*(0.5**gen)
+                  })
+
+              qc_status="PASS" if raw_nonempty==62 else "REVIEW_ENTRY_COUNT"
+              qc_rows.append({
+                  "horse_id":hid,"horse_name":hname,
+                  "declared_entry_count":row.get("pedigree_entry_count",""),
+                  "nonempty_entry_count":raw_nonempty,
+                  "mojibake_cells_repaired":repaired,
+                  "qc_status":qc_status,"source_url":source
+              })
+
+              wr={"horse_id":hid,"horse_name":hname,"source_url":source,"qc_status":qc_status}
+              for p in PATHS:
+                  wr[f"ped_{p}"]=entries.get(p,"")
+              wide_rows.append(wr)
+
+              # Repeated ancestor / cross analysis.
+              occ=defaultdict(list)
+              for p,n in entries.items():
+                  cn=canonical_name(n)
+                  if cn:
+                      occ[cn].append(p)
+
+              repeated=0
+              wright_f=0.0
+              cross_tokens=[]
+              for anc,paths in sorted(occ.items()):
+                  if len(paths)<2:
+                      continue
+                  repeated += 1
+                  gens=sorted(len(p) for p in paths)
+                  total_blood=sum(100*(0.5**g) for g in gens)
+                  s_paths=[p for p in paths if p.startswith("S")]
+                  d_paths=[p for p in paths if p.startswith("D")]
+                  # Approximate Wright F contribution, assuming common ancestor F_A=0.
+                  f_contrib=0.0
+                  for sp in s_paths:
+                      for dp in d_paths:
+                          f_contrib += 0.5**(len(sp)+len(dp)-1)
+                  wright_f += f_contrib
+                  patt="x".join(map(str,gens))
+                  cross_tokens.append(f"{anc}:{patt}")
+                  cross_rows.append({
+                      "horse_id":hid,"horse_name":hname,"ancestor":anc,
+                      "occurrences":len(paths),"cross_pattern":patt,
+                      "paths":"|".join(paths),
+                      "total_blood_share_pct":total_blood,
+                      "wright_F_contribution_pct":100*f_contrib,
+                      "is_sire_dam_common":bool(s_paths and d_paths)
+                  })
+
+              sire=canonical_name(entries.get("S",""))
+              dam=canonical_name(entries.get("D",""))
+              bms=canonical_name(entries.get("DS",""))
+              sire_sire=canonical_name(entries.get("SS",""))
+              sire_dam_sire=canonical_name(entries.get("SDS",""))
+              dam_dam=canonical_name(entries.get("DD",""))
+              female_tail=[canonical_name(entries.get("D"*g,"")) for g in range(1,6)]
+              female_tail=[x for x in female_tail if x]
+              female_tail_5=female_tail[-1] if female_tail else ""
+
+              sire_line=lineage_from_branch(entries,"S")
+              bms_line=lineage_from_branch(entries,"DS") if entries.get("DS","") else "UNKNOWN"
+              dam_sire_line=bms_line
+              sire_broad=broad_line(sire_line)
+              bms_broad=broad_line(bms_line)
+
+              # Blood-share features for major ancestors. These overlap by design and are not a partition.
+              tracked=[
+                  "Sunday Silence","Northern Dancer","Mr. Prospector","Kingmambo","Roberto",
+                  "Sadler's Wells","Danzig","Halo","Hail to Reason","Seattle Slew","A.P. Indy",
+                  "Nijinsky","Nureyev","Storm Cat","Deputy Minister","Tony Bin","Lyphard",
+                  "Raise a Native","Native Dancer"
+              ]
+              blood={}
+              for anc in tracked:
+                  paths=occ.get(anc,[])
+                  blood[anc]=sum(100*(0.5**len(p)) for p in paths)
+
+              fr={
+                  "horse_id":hid,"horse_name":hname,"source_url":source,"qc_status":qc_status,
+                  "sire":sire,"dam":dam,"broodmare_sire":bms,
+                  "sire_sire":sire_sire,"sire_dam_sire":sire_dam_sire,"dam_dam":dam_dam,
+                  "female_tail_5gen":female_tail_5,
+                  "sire_line":sire_line,"sire_broad_line":sire_broad,
+                  "broodmare_sire_line":bms_line,"broodmare_sire_broad_line":bms_broad,
+                  "sire_x_bms_line":f"{sire_line}__X__{bms_line}",
+                  "sire_broad_x_bms_broad":f"{sire_broad}__X__{bms_broad}",
+                  "sire_line_x_female_tail":f"{sire_line}__X__{female_tail_5 or 'UNKNOWN'}",
+                  "repeated_ancestor_count":repeated,
+                  "cross_summary":";".join(cross_tokens),
+                  "wright_F_approx_pct":100*wright_f,
+              }
+              for anc,val in blood.items():
+                  key="blood_"+re.sub(r"[^A-Za-z0-9]+","_",anc).strip("_").lower()+"_pct"
+                  fr[key]=val
+              feature_rows.append(fr)
+
+          pd.DataFrame(wide_rows).to_csv(OUT_WIDE,index=False,encoding="utf-8-sig")
+          pd.DataFrame(long_rows).to_csv(OUT_LONG,index=False,encoding="utf-8-sig")
+          pd.DataFrame(cross_rows).to_csv(OUT_CROSS,index=False,encoding="utf-8-sig")
+          pd.DataFrame(feature_rows).to_csv(OUT_FEATURES,index=False,encoding="utf-8-sig")
+          pd.DataFrame(qc_rows).to_csv(OUT_QC,index=False,encoding="utf-8-sig")
+
+          dict_rows=[]
+          for tag,founders in LINE_RULES:
+              dict_rows.append({
+                  "line_tag":tag,
+                  "founders":"|".join(sorted(founders)),
+                  "broad_parent":BROAD_PARENT.get(tag,""),
+                  "rule":"nearest recognized ancestor on paternal branch"
+              })
+          pd.DataFrame(dict_rows).to_csv(OUT_DICT,index=False,encoding="utf-8-sig")
+
+          qcdf=pd.DataFrame(qc_rows)
+          print("horses",len(qcdf))
+          print("qc_pass",int((qcdf.qc_status=="PASS").sum()))
+          print("qc_review",int((qcdf.qc_status!="PASS").sum()))
+          print("mojibake_repaired",int(qcdf.mojibake_cells_repaired.sum()))
+          print("outputs",OUT_WIDE,OUT_LONG,OUT_CROSS,OUT_FEATURES,OUT_DICT,OUT_QC)
+          PY
+
+          python build_pedigree_features.py
+
+      - name: Commit pedigree feature outputs
+        run: |
+          git config user.name "pedigree-structure-bot"
+          git config user.email "pedigree-structure-bot@users.noreply.github.com"
+          git add \
+            pedigree_5gen_structured.csv \
+            pedigree_positions_long.csv \
+            pedigree_crosses.csv \
+            pedigree_features_v1.csv \
+            pedigree_lineage_dictionary_v1.csv \
+            pedigree_qc_v1.csv
+          git diff --cached --quiet || git commit -m "Build structured pedigree features v1"
+          git push
